@@ -1,6 +1,8 @@
-#include "Server.h"
+#include "ServiceManager.h"
+#include <tchar.h>
 
-int main()
+int _tmain(int argc, _TCHAR* argv[])
 {
-	Server server;
+	ServiceManager::process(argc, argv);
+	return 0;
 }

@@ -1,161 +1,389 @@
-#include "Client.h"
 #include <QString>
+#include <QFileDialog>
+#include <QInputDialog>
 #include <QThread>
+#include <QProgressBar>
+
 #include <IPC.h>
-#include <array>
-#include <iostream>
-#include <sstream>
+#include <IPCMailslot.h>
+#include <IO.h>
+#include <TlHelp32.h>
+#include <QTime>
+#include "Client.h"
 
-struct TestStruct
-{
-	char testStringFromStruct[256];
-	int16_t testNumberFromStruct;
-};
+#include "FileDialog.h"
 
+#define SVCNAME TEXT("AVService")
 
 Client::Client(QWidget *parent)
     : QMainWindow(parent)
 {
     ui.setupUi(this);
-	connect(this, &Client::output, ui.textEdit, &QTextEdit::append);
+	ui.scanProgressBar->hide();
+	QHeaderView* monitorTableHeaderView = ui.monitorTable->horizontalHeader();
+	monitorTableHeaderView->setSectionResizeMode(0, QHeaderView::Stretch);
+	QHeaderView* scheduleTableHeaderView = ui.scheduleScanTable->horizontalHeader();
+	scheduleTableHeaderView->setSectionResizeMode(0, QHeaderView::Stretch);
+
+	connect(this, &Client::reportOutput, ui.reportTextEdit, &QTextEdit::append);
+	connect(this, &Client::setProgressBar, ui.scanProgressBar, &QProgressBar::setValue);
+	connect(this, &Client::removeItem, ui.threatList, &QListWidget::takeItem);
 	connectToServer();
+	threats = std::make_unique<ThreatList>(u"Threats.asn");
+	loadMonitors();
+	loadScanners();
 }
 
 Client::~Client()
 {
-	ResetEvent(clientUp);
-	ipc::Disconnect(hServer);
-	ipc::Disconnect(hClient);
+	Output reader(ipc);
+	reader.writeUInt8((uint8_t)CMDCODE::CLIENTSHUTDOWN);
 }
 
-void Client::readFromServer()
+void Client::on_scanButton_clicked()
 {
-
+	
+	ui.reportTextEdit->setText(QString::fromUtf16(u"Сканируется..."));
+	ui.scanProgressBar->setValue(0);
+	ui.scanProgressBar->show();
+	scanThread = QThread::create(&Client::scanRequest, this);
+	scanThread->start();
 }
 
-void Client::writeToServer()
+void Client::on_browseButton_clicked()
 {
+	FileDialog* dialog = new FileDialog(nullptr);
+	dialog->setFileMode(QFileDialog::Directory);
+	dialog->show();
 
+	if (dialog->exec())
+		ui.pathLineEdit->setText(dialog->selectedFiles()[0]);
+}
+
+void Client::on_shutDownButton_clicked()
+{
+	Output reader(ipc);
+	reader.writeUInt8((uint8_t)CMDCODE::SERVERSHUTDOWN);
+	QCoreApplication::quit();
+}
+
+
+void Client::on_schedulePageButton_clicked()
+{
+	ui.stackedWidget->setCurrentIndex(3);
+}
+
+void Client::on_monitorPageButton_clicked()
+{
+	ui.stackedWidget->setCurrentIndex(2);
+}
+
+void Client::on_reportButton_clicked()
+{
+	threats->load();
+
+	ui.threatList->clear();
+	for (size_t i = 0; i < threats->size(); i++)
+	{
+		ui.threatList->addItem(QString::fromUtf16(threats->get(i).c_str()));
+	}
+
+	ui.stackedWidget->setCurrentIndex(1);
+}
+
+void Client::on_backButton_clicked()
+{
+	ui.stackedWidget->setCurrentIndex(0);
+}
+
+void Client::on_deleteButton_clicked()
+{
+	if (ui.threatList->selectedItems().empty())
+		return;
+
+	uint64_t index = ui.threatList->row(ui.threatList->selectedItems()[0]);
+	QThread* deleteThread = QThread::create(&Client::deleteRequest, this, index);
+	deleteThread->start();
+}
+
+void Client::on_monitorButton_clicked()
+{
+	QThread* monitorSetupThread = QThread::create(&Client::setupMonitor, this, ui.monitorPathEdit->text().toStdU16String());
+	monitorSetupThread->start();
+
+	ui.monitorTable->setRowCount(ui.monitorTable->rowCount() + 1);
+
+	int lastIndex = ui.monitorTable->rowCount() - 1;
+	ui.monitorTable->setItem(lastIndex, 0, new QTableWidgetItem(ui.monitorPathEdit->text()));
+}
+
+void Client::on_stopScanButton_clicked()
+{
+	scanThread->terminate();
+	scanThread->wait();
+
+	Output writer(ipc);
+
+	writer.writeUInt8((uint8_t)CMDCODE::STOPSCAN);
+	
+
+	Input reader(ipc);
+	bool success = (bool)reader.readUInt8();
+
+
+	if (success)
+	{
+		reportOutput(QString::fromUtf16(u"Сканирование остановлено"));
+	}
+}
+
+void Client::on_stopMonitorButton_clicked()
+{
+	if (ui.monitorTable->selectedItems().empty())
+		return;
+
+	uint64_t index = ui.monitorTable->row(ui.monitorTable->selectedItems()[0]);
+
+	ui.monitorTable->removeRow(index);
+
+	Output writer(ipc);
+
+	writer.writeUInt8((uint8_t)CMDCODE::STOPMONITOR);
+	writer.writeUInt64(index);
+}
+
+void Client::on_monitorBackButton_clicked()
+{
+	ui.stackedWidget->setCurrentIndex(0);
+}
+
+void Client::on_monitorBrowseButton_clicked()
+{
+	FileDialog* dialog = new FileDialog(nullptr);
+	dialog->setFileMode(QFileDialog::Directory);
+	dialog->show();
+
+	if (dialog->exec())
+		ui.monitorPathEdit->setText(dialog->selectedFiles()[0]);
+}
+
+void Client::on_scheduleScanButton_clicked()
+{
+	Output writer(ipc);
+	writer.writeUInt8((uint8_t)CMDCODE::SCHEDULESCAN);
+		
+	writer.writeU16String(ui.schedulePathEdit->text().toStdU16String());
+	uint32_t hours = (uint32_t)(ui.scheduleTimeEdit->time().hour());
+	uint32_t minutes = (uint32_t)(ui.scheduleTimeEdit->time().minute());
+	writer.writeUInt32(hours);
+	writer.writeUInt32(minutes);
+
+
+	ui.scheduleScanTable->setRowCount(ui.scheduleScanTable->rowCount() + 1);
+
+	int lastIndex = ui.scheduleScanTable->rowCount() - 1;
+	ui.scheduleScanTable->setItem(lastIndex, 0, new QTableWidgetItem(ui.schedulePathEdit->text()));
+
+	QString time = QString::number(hours) + QString(":") + QString::number(minutes);
+	ui.scheduleScanTable->setItem(lastIndex, 1, new QTableWidgetItem(time));
+}
+
+void Client::on_scheduleBackButton_clicked()
+{
+	ui.stackedWidget->setCurrentIndex(0);
+}
+
+void Client::on_cancelScheduleScanButton_clicked()
+{
+	if (ui.scheduleScanTable->selectedItems().empty())
+		return;
+
+	uint64_t index = ui.scheduleScanTable->row(ui.scheduleScanTable->selectedItems()[0]);
+
+	Output writer(ipc);
+	writer.writeUInt8((uint8_t)CMDCODE::CANCELSCHEDULESCAN);
+	writer.writeUInt64(index);
+
+	ui.scheduleScanTable->removeRow(index);
+}
+
+void Client::on_scheduleBrowseButton_clicked()
+{
+	FileDialog* dialog = new FileDialog(nullptr);
+	dialog->setFileMode(QFileDialog::Directory);
+	dialog->show();
+
+	if (dialog->exec())
+		ui.schedulePathEdit->setText(dialog->selectedFiles()[0]);
 }
 
 void Client::connectToServer()
 {
-	hClient = ipc::CreateSlot(u"\\\\.\\mailslot\\client");
-	hServer = ipc::ConnectToSlot(u"\\\\.\\mailslot\\server");
+	wakeUpServer();
 
-	if (ipc::IsInvalid(hServer))
+	ipc = IPC::Mailslots(u"\\\\.\\mailslot\\client", u"\\\\.\\mailslot\\server");
+
+	ipc->connect();
+}
+
+
+void Client::scanRequest()
+{
+	Output writer(ipc);
+	scanIpc.reset();
+	scanIpc = IPC::Mailslots(u"\\\\.\\mailslot\\clientScan", u"\\\\.\\mailslot\\server");
+	Input reader(scanIpc);
+
+	writer.writeUInt8((uint8_t)CMDCODE::SCAN);
+	writer.writeU16String(ui.pathLineEdit->text().toStdU16String());
+	writer.writeU16String(u"\\\\.\\mailslot\\clientScan");
+
+	uint64_t fileCount = reader.readUInt64();
+	uint64_t scannedFilesCount = 0;
+
+	for (uint64_t i = 0; i < fileCount; i++)
 	{
-		wakeUpServer();
-
-		while (true)
+		std::u16string path = reader.readU16String();
+		bool safe = reader.readUInt8();
+		if (!safe)
 		{
-			hServer = ipc::ConnectToSlot(u"\\\\.\\mailslot\\server");
+			std::u16string virusName = reader.readU16String();
 
-			if (!ipc::IsInvalid(hServer))
-				break;
-
-			Sleep(10);
+			QString report = QString::fromUtf16(path.c_str()) + QString::fromUtf16(u" найден ") + QString::fromUtf16(virusName.c_str());
+			reportOutput(report);
 		}
-	}
-	clientUp = OpenEvent(EVENT_ALL_ACCESS, NULL, TEXT("ClientUpEvent"));
-	SetEvent(clientUp);
-}
+		else
+		{
 
+			QString report = QString::fromUtf16(path.c_str()) + QString::fromUtf16(u" угроз нет");
+			reportOutput(report);
+		}
 
-void Client::on_testButton_clicked()
-{
-	QThread* thread = QThread::create(&Client::IPCtestRequest, this);
-	thread->start();
-}
-
-void Client::IPCtestRequest()
-{
-	// TEST DATA
-	uint32_t testNumber = 8000;
-
-	std::u16string testString = u"String";
-
-	std::array <int16_t, 9> testArray = {
-		15, 43, -138, -64, 0, 7, 431, 1, 2 
-	};
-
-	TestStruct testStruct = { "Happy New Year", -677 };
-	////////////
-
-	// send to server
-	if (!ipc::IsInvalid(hServer))
-	{
-		QString report = QString::fromUtf16(u"Отправка серверу:\n");
-		report += QString::number(testNumber) + "\n";
-		report += QString::fromUtf16(testString.c_str()) + "\n";
-		for (auto el : testArray)
-			report += QString::number(el) + " ";
-		report += "\n";
-		report += testStruct.testStringFromStruct + QString("\n");
-		report += QString::number(testStruct.testNumberFromStruct) + "\n";
-
-		output(report);
-
-		ipc::WriteUInt8(hServer, (uint8_t)CMDCODE::TEST);
-		ipc::WriteUInt32(hServer, testNumber);
-		ipc::WriteU16String(hServer, testString);
-		ipc::WriteArrayInt16(hServer, testArray.data(), testArray.size());
-		ipc::WriteStruct<TestStruct>(hServer, testStruct);
-	}
-
-	if (!ipc::IsInvalid(hClient))
-	{
-		// read echo from server
-		uint32_t testNumberResponse = ipc::ReadUInt32(hClient);
-		std::u16string testStringResponse = ipc::ReadU16String(hClient);
-		std::vector<int16_t> testVector = ipc::ReadArrayInt16(hClient);
-		TestStruct testStructResponse = ipc::ReadStruct<TestStruct>(hClient);
+		scannedFilesCount++;
 		
-		// output
-
-		QString report = QString::fromUtf16(u"Получено с сервера:\n");
-		report += QString::number(testNumberResponse) + "\n";
-		report += QString::fromUtf16(testStringResponse.c_str()) + "\n";
-		for (auto el : testVector)
-			report += QString::number(el) + " ";
-		report += "\n";
-		report += testStructResponse.testStringFromStruct + QString("\n");
-		report += QString::number(testStructResponse.testNumberFromStruct) + "\n";
-
-		output(report);
+		int percents = (scannedFilesCount / (float)fileCount) * 100;
+		setProgressBar(percents);
 	}
+	QString report = QString::fromUtf16(u"Файлов просканировано: ") + QString::number(scannedFilesCount);
+	reportOutput(report);
+}
+
+void Client::deleteRequest(uint64_t index)
+{
+	Output writer(ipc);
+
+	writer.writeUInt8((uint8_t)CMDCODE::DELETETHREAT);
+	writer.writeUInt64(index);
+
+	Input reader(ipc);
+	bool success = (bool)reader.readUInt8();
+
+	if (success)
+	{
+		threats->remove(index);
+		removeItem(index);
+	}
+}
+
+void Client::setupMonitor(const std::u16string& path)
+{
+	Output writer(ipc);
+
+	writer.writeUInt8((uint8_t)CMDCODE::MONITOR);
+	writer.writeU16String(path);
+}
+
+void Client::loadMonitors()
+{
+	std::u16string filePath = u"Monitors.asn";
+	Input reader(filePath);
+	if (!reader.isOpen())
+		return;
+
+	std::u16string header = reader.readU16String();
+	if (header != u"Asnachev")
+	{
+		reader.close();
+		return;
+	}
+	uint64_t recordNumber = reader.readUInt64();
+
+	for (size_t i = 0; i < recordNumber; i++)
+	{
+		std::u16string scanPath = reader.readU16String();
+
+		ui.monitorTable->setRowCount(ui.monitorTable->rowCount() + 1);
+
+		int lastIndex = ui.monitorTable->rowCount() - 1;
+		ui.monitorTable->setItem(lastIndex, 0, new QTableWidgetItem(QString::fromUtf16(scanPath.c_str())));
+	}
+
+	reader.close();
+}
+
+void Client::loadScanners()
+{
+	std::u16string filePath = u"Scanners.asn";
+
+	Input reader(filePath);
+	if (!reader.isOpen())
+		return;
+
+	std::u16string header = reader.readU16String();
+	if (header != u"Asnachev")
+	{
+		reader.close();
+		return;
+	}
+	uint64_t recordNumber = reader.readUInt64();
+
+	for (size_t i = 0; i < recordNumber; i++)
+	{
+		std::u16string scanPath = reader.readU16String();
+		uint32_t hours = reader.readUInt32();
+		uint32_t minutes = reader.readUInt32();
+
+		ui.scheduleScanTable->setRowCount(ui.scheduleScanTable->rowCount() + 1);
+
+		int lastIndex = ui.scheduleScanTable->rowCount() - 1;
+		ui.scheduleScanTable->setItem(lastIndex, 0, new QTableWidgetItem(QString::fromUtf16(scanPath.c_str())));
+		QString time = QString::number(hours) + QString(":") + QString::number(minutes);
+
+		ui.scheduleScanTable->setItem(lastIndex, 1, new QTableWidgetItem(time));
+	}
+
+	reader.close();
 }
 
 void Client::wakeUpServer()
 {
-	STARTUPINFO si;
-	PROCESS_INFORMATION pi;
-	ZeroMemory(&si, sizeof(si));
-	si.cb = sizeof(si);
-	ZeroMemory(&pi, sizeof(pi));
-	wchar_t path[256] = L"Server.exe";
-	if (!CreateProcess(NULL,
-		path,
-		NULL,
-		NULL,
-		FALSE,
-		0,
-		NULL,
-		NULL,
-		&si,
-		&pi)
-		)	
+	SC_HANDLE schSCManager = OpenSCManager(
+		NULL,                    // local computer
+		NULL,                    // ServicesActive database 
+		SC_MANAGER_CONNECT);  
+
+	if (NULL == schSCManager)
 	{
 		HRESULT error = GetLastError();
+		printf("OpenSCManager failed (%d)\n", error);
 		return;
 	}
 
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
+	SC_HANDLE schService = OpenService(
+		schSCManager,         // SCM database 
+		SVCNAME,            // name of service 
+		SERVICE_START |
+		SERVICE_QUERY_STATUS |
+		SERVICE_ENUMERATE_DEPENDENTS);
+
+	if (schService == NULL)
+	{
+		printf("OpenService failed (%d)\n", GetLastError());
+		CloseServiceHandle(schSCManager);
+		return;
+	}
+
+
+	StartService(schService, NULL, NULL);
 }
 
-void Client::sendRequest()
-{
-	writeToServer();
-	readFromServer();
-}
